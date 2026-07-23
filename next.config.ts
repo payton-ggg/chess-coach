@@ -1,12 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  webpack(config) {
-    // Allow loading .wasm files from public
-    config.resolve.fallback = { ...config.resolve.fallback, fs: false };
-    return config;
-  },
-  // Required for Stockfish WASM SharedArrayBuffer
+  turbopack: {},
   async headers() {
     return [
       {

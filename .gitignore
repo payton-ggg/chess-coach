@@ -40,4 +40,4 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-stockfish.wasm
+/public/stockfish.wasm

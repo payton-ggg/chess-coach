@@ -1,121 +1,92 @@
 import type { EngineEval, MoveCategory, AnalyzedMove } from '../../types';
 
+// Scores are always from White's POV in UCI. Clamp to ±1500cp.
 export function normalizeCp(score: number, mate: number | null): number {
   if (mate !== null) {
-    return mate > 0 ? 10000 - mate : -10000 + Math.abs(mate);
+    return mate > 0 ? 10000 - Math.abs(mate) : -(10000 - Math.abs(mate));
   }
   return Math.max(-1500, Math.min(1500, score));
 }
 
+// evalBefore / evalAfter MUST already be in the moving side's perspective
+// (positive = good for the mover) before calling this.
 export function classifyMove(
-  evalBefore: EngineEval,
-  evalAfter: EngineEval,
-  isBookMove: boolean,
+  cpBefore: number,
+  cpAfter: number,
   isBrilliant: boolean
 ): { category: MoveCategory; scoreLoss: number } {
-  if (isBookMove) return { category: 'book', scoreLoss: 0 };
-
-  const before = normalizeCp(evalBefore.score, evalBefore.mate);
-  const after = normalizeCp(evalAfter.score, evalAfter.mate);
-
-  // Score is always from white's perspective; loss is relative to whose turn it was
-  const colorSign = evalBefore.score !== undefined ? 1 : 1;
-  const loss = before - after; // positive = white lost material
-
-  // When it's black's turn, white gain = black loss
-  const actualLoss = colorSign * loss;
-
-  const absBefore = Math.abs(before);
-  const absAfter = Math.abs(after);
-  let cpLoss = absBefore - absAfter;
-  // If signs flipped (blunder that changes who's winning)
-  if (Math.sign(before) !== Math.sign(after) && before !== 0 && after !== 0) {
-    cpLoss = Math.abs(before) + Math.abs(after);
+  if (isBrilliant) {
+    const loss = Math.max(0, cpBefore - cpAfter);
+    return { category: 'brilliant', scoreLoss: loss };
   }
 
-  if (isBrilliant) return { category: 'brilliant', scoreLoss: Math.max(0, cpLoss) };
-
-  // best move played
-  const isBestMove =
-    evalAfter.bestMove === undefined ||
-    evalBefore.bestMove === undefined ||
-    cpLoss <= 10;
+  // how many centipawns the mover lost by playing this move
+  const cpLoss = Math.max(0, cpBefore - cpAfter);
 
   let category: MoveCategory;
+  if (cpLoss <= 10)       category = 'best';
+  else if (cpLoss <= 25)  category = 'excellent';
+  else if (cpLoss <= 50)  category = 'good';
+  else if (cpLoss <= 100) category = 'inaccuracy';
+  else if (cpLoss <= 200) category = 'mistake';
+  else                    category = 'blunder';
 
-  if (cpLoss <= 5) {
-    category = 'best';
-  } else if (cpLoss <= 15) {
-    category = 'excellent';
-  } else if (cpLoss <= 30) {
-    category = 'good';
-  } else if (cpLoss <= 60) {
-    category = 'inaccuracy';
-  } else if (cpLoss <= 120) {
-    category = 'mistake';
-  } else {
-    category = 'blunder';
-  }
-
-  return { category, scoreLoss: Math.max(0, cpLoss) };
+  return { category, scoreLoss: cpLoss };
 }
 
 export function isBrilliantMove(
   evalBefore: EngineEval,
   evalAfter: EngineEval,
   uci: string,
-  san: string
+  san: string,
+  color: 'w' | 'b'
 ): boolean {
-  // Must be close to best move
-  const cpDiff =
-    Math.abs(normalizeCp(evalBefore.score, evalBefore.mate)) -
-    Math.abs(normalizeCp(evalAfter.score, evalAfter.mate));
-  if (cpDiff < -10) return false;
+  const sign = color === 'w' ? 1 : -1;
+  const before = sign * normalizeCp(evalBefore.score, evalBefore.mate);
+  const after  = sign * normalizeCp(evalAfter.score,  evalAfter.mate);
 
-  const isSacrifice = san.includes('x') && /[RQBN]/.test(san[0] || '');
-  const leadsToMate =
-    evalAfter.mate !== null && evalAfter.mate > 0 && evalBefore.mate === null;
-  const prevBest = evalBefore.pv?.[0];
-  const isOnlyMove = prevBest === uci;
+  // Must not be losing
+  if (after < before - 50) return false;
 
-  if (leadsToMate && isSacrifice) return true;
-  if (leadsToMate && isOnlyMove) return true;
-  if (isSacrifice && isOnlyMove && cpDiff < 50) return true;
+  const isSacrifice = san.includes('x') && /[RQBN]/.test(san[0] ?? '');
+  const leadsToMate = evalAfter.mate !== null && sign * evalAfter.mate > 0 && evalBefore.mate === null;
+  const isOnlyMove  = evalBefore.pv?.[0] === uci;
 
-  return false;
+  return (leadsToMate && isSacrifice) ||
+         (leadsToMate && isOnlyMove)  ||
+         (isSacrifice && isOnlyMove && after >= before - 30);
 }
 
 export function buildExplanation(move: Partial<AnalyzedMove>): string {
-  const { san, category, scoreLoss, evalAfter } = move;
-
+  const { san, category, scoreLoss, evalAfter, color } = move;
   if (!category || !san) return '';
 
-  const scoreStr =
-    evalAfter?.mate !== null && evalAfter?.mate !== undefined
+  const sign = color === 'w' ? 1 : -1;
+  const scoreStr = evalAfter
+    ? evalAfter.mate !== null
       ? `Mate in ${Math.abs(evalAfter.mate)}`
-      : evalAfter
-      ? `${(evalAfter.score / 100).toFixed(2)}`
-      : '';
+      : `${((sign * evalAfter.score) / 100).toFixed(2)}`
+    : '';
 
   switch (category) {
     case 'brilliant':
-      return `Brilliant move! ${san} is a spectacular play — likely involving a sacrifice or a unique tactical idea that wins material or leads to a decisive advantage. ${scoreStr}`;
+      return `Brilliant move! ${san} is a spectacular play — likely a sacrifice or unique tactical idea leading to a decisive advantage. ${scoreStr}`;
     case 'great':
       return `Great move! ${san} is one of the best continuations in this position. ${scoreStr}`;
     case 'best':
       return `Best move. ${san} is the engine's top choice. ${scoreStr}`;
     case 'excellent':
-      return `Excellent move. ${san} is very strong, losing only ${scoreLoss} centipawns from optimal. ${scoreStr}`;
+      return `Excellent move. ${san} is very strong, only ${scoreLoss}cp from optimal. ${scoreStr}`;
     case 'good':
-      return `Good move. ${san} is a solid continuation. Minor inaccuracies (${scoreLoss}cp) can be improved, but this is playable. ${scoreStr}`;
+      return `Good move. ${san} is a solid continuation (${scoreLoss}cp loss). ${scoreStr}`;
     case 'book':
       return `Book move. ${san} follows established opening theory.`;
     case 'inaccuracy':
-      return `Inaccuracy. ${san} loses ${scoreLoss} centipawns. The position could have been handled better — look for more precise continuations. ${scoreStr}`;
+      return `Inaccuracy. ${san} loses ${scoreLoss}cp — a more precise continuation was available. ${scoreStr}`;
     case 'mistake':
-      return `Mistake! ${san} loses ${scoreLoss} centipawns. This significantly weakens your position. Consider what you missed. ${scoreStr}`;
+      return `Mistake! ${san} loses ${scoreLoss}cp and significantly weakens your position. ${scoreStr}`;
     case 'blunder':
-      return `Blunder! ${san} drops ${scoreLoss} centipawns. This is a serious error that may cost the game. Review this position carefully. ${scoreStr}`;
+      return `Blunder! ${san} drops ${scoreLoss}cp. Review this position carefully. ${scoreStr}`;
     default:
       return '';
   }
@@ -129,14 +100,16 @@ export function calcAccuracy(moves: AnalyzedMove[], color: 'w' | 'b'): number {
   const colorMoves = moves.filter((m) => m.color === color && m.evalBefore && m.evalAfter);
   if (colorMoves.length === 0) return 100;
 
-  const totalWinLoss = colorMoves.reduce((acc, m) => {
-    const before = normalizeCp(m.evalBefore!.score, m.evalBefore!.mate);
-    const after = normalizeCp(m.evalAfter!.score, m.evalAfter!.mate);
-    const wBefore = cpToWinProb(color === 'w' ? before : -before);
-    const wAfter = cpToWinProb(color === 'w' ? after : -after);
+  const sign = color === 'w' ? 1 : -1;
+
+  const totalLoss = colorMoves.reduce((acc, m) => {
+    const before = sign * normalizeCp(m.evalBefore!.score, m.evalBefore!.mate);
+    const after  = sign * normalizeCp(m.evalAfter!.score,  m.evalAfter!.mate);
+    const wBefore = cpToWinProb(before);
+    const wAfter  = cpToWinProb(after);
     return acc + Math.max(0, wBefore - wAfter);
   }, 0);
 
-  const avgLoss = totalWinLoss / colorMoves.length;
+  const avgLoss = totalLoss / colorMoves.length;
   return Math.round(Math.max(0, (1 - avgLoss) * 100) * 10) / 10;
 }
